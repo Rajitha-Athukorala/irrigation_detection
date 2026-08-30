@@ -1,0 +1,961 @@
+---
+title: "DTS_GAM"
+author: "Rajitha"
+date: "2026-08-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This script provides the model setup and workflow described in the paper *“Estimating Continuous Field-Level Irrigation Water Use in Australian Cotton Using Sentinel-1 Observations.”* It is intended to provide a transparent and reproducible description of the modelling framework and to serve as a general template that can be adapted to user-specific datasets and applications.
+
+# Import packages
+
+```{r}
+library(dplyr)
+library(mgcv)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(gratia)
+library(MASS)
+```
+
+# Load data
+
+```{r}
+# 2023 the main analysis year
+
+#irrigation data
+irr_dts_cm_data_2023 <- read_csv('path/to/irrigation/data/as/a/csv')
+irr_dts_cm_data_2023 <- irr_dts_cm_data_2023 %>%rename(Date = observation_date)
+
+# weatehr data - rainfall
+silo_dts_data_2023 = read_csv('path/to/rainfall/data/as/a/csv')
+silo_dts_data_2023 <- silo_dts_data_2023 %>% rename(Date = observation_date)
+
+# sentinel 1 data
+s1_dts_data_2023 = read_csv('path/to/s1/data/as/a/csv')
+
+```
+
+# Field selection for training and test data
+
+The `field_select()` function prepares the Sentinel-1 and irrigation datasets for model training and independent field-level testing. It identifies field columns, assigns zero irrigation to fields without corresponding irrigation records, randomly partitions the available fields into training (two-thirds) and testing (one-third) subsets, and selects a non-irrigated field to use as the control field. The selected control-field Sentinel-1 time series is then appended to both the training and test Sentinel-1 datasets.
+
+**Inputs**
+
+-   `s1_data`: A wide-format data frame containing Sentinel-1 observations. It must contain a `Date` column and separate columns for each field. Field columns are expected to begin with a prefix. The default is set to `"TO"` (e.g., `TO01`, `TO02`, etc.).
+-   `irr_data`: A wide-format data frame containing irrigation volumes for the fields. It must contain `interval_start`, `interval_end`, and `Date` columns, together with field-specific irrigation columns whose names correspond to those in `s1_data`. Fields present in `s1_data` but absent from `irr_data` are assumed to be non-irrigated and are assigned an irrigation volume of zero.
+-   `prefix`: Field-name prefix. The default is `"TO"`.
+-   `seed`: Random seed used to ensure reproducibility of the training/test field split and control-field selection. The default is `123`.
+-   `control`: Optional name of the field to use as the non-irrigated control field. If `NULL`, one field is randomly selected from the fields identified as non-irrigated.
+
+**Processing**
+
+The function randomly assigns two-thirds of the available fields to the training dataset, with the remaining one-third used for testing. Sentinel-1 data are converted from wide to long format, with field identifiers stored in `Treatment` and Sentinel-1 observations stored in `Value`. Irrigation data are similarly converted to long format, with field identifiers stored in `Site` and irrigation amounts in `Irrigation_volume`. The Sentinel-1 time series of the selected control field is joined to both the training and test Sentinel-1 datasets by `Date`.
+
+The selected control-field name is also printed during execution.
+
+**Output**
+
+The function returns a list containing four data frames:
+
+-   `s1_train`: Long-format Sentinel-1 observations for the training fields, including the Sentinel-1 time series of the selected control field.
+-   `irr_train`: Long-format irrigation observations for the training fields, containing `interval_start`, `interval_end`, `Date`, `Site`, and `Irrigation_volume`.
+-   `s1_test`: Long-format Sentinel-1 observations for the held-out test fields, including the same control-field Sentinel-1 time series.
+-   `irr_test`: Long-format irrigation observations for the held-out test fields, containing `interval_start`, `interval_end`, `Date`, `Site`, and `Irrigation_volume`.
+
+Using the same `seed` and identical input data will reproduce the same training/test partition and, when `control = NULL`, the same randomly selected control field.
+
+```{r}
+field_select <- function(s1_data, irr_data, prefix = 'TO', seed=123, control=NULL){
+  # Get all columns in s1 dataframe
+  all_cols = names(s1_data)
+  all_to_cols = all_cols[startsWith(all_cols, prefix)]
+  
+  # Get the missing columns in irr
+  all_irr_cols = names(irr_data)[startsWith(names(irr_data), prefix)]
+  non_irr_cols = setdiff(all_to_cols, all_irr_cols)
+  
+  # add zero irrigation volumes to the non irrigates fields
+  for (col in non_irr_cols) {
+    irr_data[[col]] <- 0}
+  
+  
+  # Randomly select 2/3 of those columns
+  set.seed(seed)
+  num_to_select <- floor((2/3) * length(all_to_cols))
+  selected_to_cols <- sample(all_to_cols, num_to_select)
+  
+  # The rest are test columns
+  selected_test_cols <- setdiff(all_to_cols, selected_to_cols)
+  
+  # Select columns in each dataframe
+  s1_train <- s1_data %>%
+    select(Date, all_of(selected_to_cols)) %>%
+  pivot_longer(
+    cols = starts_with(prefix),
+    names_to = "Treatment",
+    values_to = "Value"
+  )
+  
+  irr_train <- irr_data %>%
+    select(interval_start, interval_end, Date, all_of(selected_to_cols))
+  
+  # Randomly sample 1 non-irrigated field unless the control is selected
+  # Only sample control if not provided
+  if (is.null(control)) {
+    set.seed(seed)
+    control <- sample(non_irr_cols, 1)
+  }
+  
+  print(c('Control station: ', control))
+  
+  irr_train <- irr_train %>%
+    pivot_longer(
+    cols = starts_with(prefix),
+    names_to = "Site",
+    values_to = "Irrigation_volume")
+  
+  # Add the control station to s1 data
+  
+  s1_train_control <- s1_train %>%
+    left_join(s1_data %>% select(Date, all_of(control)), by = "Date")
+  
+  # Prepare test data similarly for the test stations
+  
+  s1_test <- s1_data %>%
+    select(Date, all_of(selected_test_cols)) %>%
+    pivot_longer(
+      cols = all_of(selected_test_cols),
+      names_to = "Treatment",
+      values_to = "Value"
+    )
+  
+  s1_test_control <- s1_test %>% 
+    left_join(s1_data %>% select(Date, all_of(control)), by = "Date")
+  
+  irr_test <- irr_data %>%
+    select(interval_start, interval_end, Date, all_of(selected_test_cols)) %>%
+    pivot_longer(
+      cols = all_of(selected_test_cols),
+      names_to = "Site",
+      values_to = "Irrigation_volume"
+    )
+  
+  
+  
+  # Return train and test as a list
+  return(list(
+    s1_train = s1_train_control,
+    irr_train = irr_train,
+    s1_test = s1_test_control,
+    irr_test = irr_test
+  ))
+}
+```
+
+# Design matrix creation
+
+The `design_mat()` function constructs the design matrix used for subsequent irrigation modelling. It combines field-level irrigation observations with Sentinel-1 backscatter data and climate information, and derives additional predictor and response variables required for model development.
+
+**Inputs**
+
+-   `train_irr`: A long-format data frame containing field-level irrigation information. The expected structure corresponds to the `irr_train` or `irr_test` output from `field_select()`. It should contain `Date`, `Site`, `Irrigation_volume`, `interval_start`, and `interval_end`.
+
+-   `train_s1`: A long-format data frame containing Sentinel-1 observations corresponding to the irrigation data. It must contain:
+
+    -   `Value`: Sentinel-1 backscatter for the individual field.
+
+    -   A column containing Sentinel-1 backscatter for the control field.
+
+    The control-field column may either retain its original field name (e.g., `"TO63"`) or have previously been renamed to `S1_control`.
+
+-   `silo_data`: A data frame containing daily climate data to be incorporated into the design matrix. It must contain a `Date` column that can be matched to the `Date` column in the irrigation and Sentinel-1 datasets. All additional columns in `silo_data` are retained following the join.
+
+-   `control`: Name of the Sentinel-1 column representing the non-irrigated control field. The default is `"TO63"`. If a column named `S1_control` already exists in `train_s1`, it is automatically used instead of the value supplied through `control`.
+
+**Processing**
+
+The function first identifies the control-field Sentinel-1 column and renames it to `S1_control` for consistency. If the required control column cannot be found, execution stops with an error message.
+
+The field-level Sentinel-1 observations (`Value`) and control-field observations (`S1_control`) are then combined with the irrigation dataset. Several additional variables are created:
+
+-   `month`: Month corresponding to each observation date, represented as a categorical factor with values 1–12.
+
+-   `irr_bin`: Binary indicator of an irrigation event, where `1` represents an irrigation volume greater than zero and `0` represents no recorded irrigation.
+
+-   Climate variables: Variables from `silo_data` are joined to the dataset using `Date`.
+
+-   `S1_diff`: Difference between the field and control Sentinel-1 backscatter, calculated as `Value - S1_control`.
+
+**Output**
+
+The function returns a single data frame (`df_combined`) containing the original irrigation information, field and control Sentinel-1 observations, climate variables, and the derived variables required for subsequent modelling.
+
+The principal derived columns are:
+
+-   `S1_control`: Sentinel-1 backscatter of the selected non-irrigated control field.
+
+-   `month`: Categorical month of observation.
+
+-   `irr_bin`: Binary irrigation-event indicator.
+
+-   `S1_diff`: Difference between field and control-field Sentinel-1 backscatter.
+
+The returned data frame can subsequently be used as the model design matrix for irrigation-event detection and irrigation-volume estimation.
+
+```{r}
+design_mat <- function(
+    train_irr,
+    train_s1,
+    silo_data,
+    control = "TO63"
+) {
+
+  # Determine whether the control column has already been renamed
+  control_col <- if ("S1_control" %in% names(train_s1)) {
+    "S1_control"
+  } else {
+    control
+  }
+
+  if (!control_col %in% names(train_s1)) {
+    stop(
+      paste0(
+        "Control column '", control_col,
+        "' was not found in train_s1."
+      )
+    )
+  }
+
+  # Select only required S1 columns
+  s1_selected <- train_s1 %>%
+    dplyr::select(
+      Value,
+      S1_control = dplyr::all_of(control_col)
+    )
+
+  # Combine irrigation and Sentinel-1 data
+  df_combined <- dplyr::bind_cols(
+    train_irr,
+    s1_selected
+  )
+
+  # Add month
+  df_combined$month <- lubridate::month(df_combined$Date)
+  df_combined$month <- as.factor(df_combined$month)
+
+  # Binary irrigation-event variable
+  df_combined$irr_bin <- as.integer(
+    df_combined$Irrigation_volume > 0
+  )
+
+  # Add SILO climate data
+  df_combined <- dplyr::left_join(
+    df_combined,
+    silo_data,
+    by = "Date"
+  )
+
+  # Difference between field and control backscatter
+  df_combined$S1_diff <- (
+    df_combined$Value - df_combined$S1_control
+  )
+
+  return(df_combined)
+}
+```
+
+# GAM model for volume
+
+Now we proceed to the model
+
+```{r}
+# 2023 test
+train_data_vol_2023 = field_select(s1_dts_data_2023, irr_dts_cm_data_2023, seed = 311, control = 'TO79')
+```
+
+```{r}
+x_train_2023 = design_mat(train_data_vol_2023$irr_train, train_data_vol_2023$s1_train, silo_dts_data_2023, control='TO79')
+x_test_2023 = design_mat(train_data_vol_2023$irr_test, train_data_vol_2023$s1_test, silo_dts_data_2023, control='TO79')
+```
+
+```{r}
+x_train_2023$season_month <- match(x_train_2023$month, c(10, 11, 12, 1, 2, 3, 4))
+x_test_2023$season_month <- match(x_test_2023$month, c(10, 11, 12, 1, 2, 3, 4))
+```
+
+## GAM model fit
+
+The following Generalised Additive Model (GAM) estimates irrigation volume from Sentinel-1 backscatter and rainfall information. The model is fitted using the design matrix generated in the previous step.
+
+```         
+gam_dts_vol_2023 <- gam(   Irrigation_volume ~      te(S1_control, Value, season_month, k = c(6, 6, 5)) +     s(Rain),   method = "REML",   family = tw(link = "log"),   data = x_train_2023 ) 
+```
+
+The response variable, `Irrigation_volume`, represents the irrigation volume associated with each observation interval.
+
+The model contains two main components:
+
+-   `te(S1_control, Value, season_month, k = c(6, 6, 5))` specifies a tensor-product smooth describing the joint relationship between Sentinel-1 backscatter from the non-irrigated control field (`S1_control`), Sentinel-1 backscatter from the irrigated field (`Value`), and the seasonal position of the observation (`season_month`). This allows the relationship between field and control backscatter to vary through the growing season rather than assuming that the same backscatter response applies throughout the entire season. The `k` values specify the basis dimensions used for the three variables within the tensor-product smooth.
+
+-   `s(Rain)` specifies a smooth effect of rainfall, allowing irrigation volume to respond non-linearly to rainfall without imposing a predefined functional relationship.
+
+The model is fitted using restricted maximum likelihood (`method = "REML"`) to estimate the smoothness parameters.
+
+A Tweedie distribution with a logarithmic link function (`family = tw(link = "log")`) is used for the response. This distribution is suitable for irrigation-volume data because the response contains both zero observations, representing periods without irrigation, and positive continuous irrigation volumes. The log link constrains the modelled mean irrigation volume to positive values.
+
+The fitted model therefore represents irrigation volume as a seasonally varying, non-linear function of the Sentinel-1 response of the field relative to the environmental response captured by the control field, while separately accounting for the influence of rainfall.
+
+```{r}
+
+gam_dts_vol_2023 <- gam(
+  Irrigation_volume ~ 
+    te(S1_control, Value, season_month, k = c(6, 6, 5)) +
+    s(Rain),
+  method = "REML",
+  family = tw(link = "log"),
+  data = x_train_2023
+)
+```
+
+```{r}
+summary(gam_dts_vol_2023)
+```
+
+## Plots of smooths
+
+```{r, fig.width=6, fig.height=4}
+season_labels <- c("October", "November", "December", "January", "February", "March", "April")
+
+for (i in 1:7) {
+  vis.gam(
+    gam_dts_vol_2023,
+    view = c("S1_control", "Value"),
+    cond = list(season_month = i),
+    plot.type = "contour",
+    too.far = 0.1,
+    color = "terrain",
+    main = paste("Season month:", season_labels[i])
+  )
+}
+```
+
+```{r}
+sm_rain <- gratia::smooth_estimates(
+  gam_dts_vol_2023,
+  select = "s(Rain)",
+  partial_match = TRUE
+)
+
+# Create plot
+rain_plot <- sm_rain |>
+  ggplot(aes(x = Rain, y = .estimate)) +
+  
+  # 95% confidence interval
+  geom_ribbon(
+    aes(
+      ymin = .estimate - 1.96 * .se,
+      ymax = .estimate + 1.96 * .se
+    ),
+    alpha = 0.3
+  ) +
+  
+  # Estimated smooth
+  geom_line(linewidth = 1) +
+  
+  # Observed rainfall values
+  geom_rug(
+    data = x_train_2023,
+    aes(x = Rain),
+    inherit.aes = FALSE,
+    sides = "b",
+    alpha = 0.5
+  ) +
+  
+  theme_bw() +
+  
+  theme(
+    axis.text = element_text(size = rel(1.5)),
+    axis.title = element_text(size = rel(2)),
+    legend.text = element_text(size = rel(1.5)),
+    legend.title = element_text(size = rel(1.5))
+  ) +
+  
+  xlab("Rainfall (mm)") +
+  ylab("Partial effect")
+
+
+# Display plot
+rain_plot
+
+
+```
+
+## Predictions
+
+```{r}
+# For training data
+pred_train_2023 <- predict(gam_dts_vol_2023, newdata = x_train_2023, type = "response", se.fit = TRUE)
+
+# For test data
+pred_test_2023 <- predict(gam_dts_vol_2023, newdata = x_test_2023, type = "response", se.fit = TRUE)
+```
+
+```{r}
+# Training
+x_train_2023$predicted_Irrigation_volume <- pred_train_2023$fit
+x_train_2023$predicted_SE <- pred_train_2023$se.fit
+
+# Test
+x_test_2023$predicted_Irrigation_volume <- pred_test_2023$fit
+x_test_2023$predicted_SE <- pred_test_2023$se.fit
+
+```
+
+## Prediction with uncertainties
+
+```{r}
+
+# Linear predictor matrix for test data
+Xp_test <- predict(
+  gam_dts_vol_2023,
+  newdata = x_test_2023,
+  type = "lpmatrix"
+)
+
+beta_hat <- coef(gam_dts_vol_2023)
+V_beta   <- vcov(gam_dts_vol_2023)
+
+set.seed(123)
+
+# Coefficient draws
+beta_draws <- MASS::mvrnorm(
+  n = 5000,
+  mu = beta_hat,
+  Sigma = V_beta
+)
+
+# Simulated linear predictors
+eta_draws <- Xp_test %*% t(beta_draws)
+
+# Check for extreme values before exponentiation
+summary(as.vector(eta_draws))
+max(eta_draws, na.rm = TRUE)
+```
+
+```{r}
+mu_draws <- exp(eta_draws)
+
+x_test_2023$predicted_Irrigation_volume <- predict(
+  gam_dts_vol_2023,
+  newdata = x_test_2023,
+  type = "response"
+)
+
+x_test_2023$predicted_lower <- apply(
+  mu_draws,
+  1,
+  quantile,
+  probs = 0.15,
+  na.rm = TRUE
+)
+
+x_test_2023$predicted_upper <- apply(
+  mu_draws,
+  1,
+  quantile,
+  probs = 0.85,
+  na.rm = TRUE
+)
+```
+
+## Counterfactual analysis plots
+
+```{r}
+
+# counterfactual plots
+
+# Prediction under observed conditions
+x_test_2023$pred_observed_rain <- predict(
+  gam_dts_vol_2023,
+  newdata = x_test_half_2023,
+  type = "response"
+)
+
+# Counterfactual dataset with rainfall removed
+x_test_no_rain_2023 <- x_test_2023 %>%
+  mutate(Rain = 0)
+
+# Prediction with Rain = 0
+x_test_half_2023$pred_no_rain <- predict(
+  gam_dts_vol_2023,
+  newdata = x_test_no_rain_2023,
+  type = "response"
+)
+
+# Difference attributable to the explicit rainfall term
+x_test_half_2023_dif <- x_test_2023 %>%
+  mutate(
+    rainfall_effect = pred_observed_rain - pred_no_rain
+  )
+```
+
+```{r}
+# counterfactual plot with rain
+# Scale rainfall to the irrigation-volume axis
+scale_factor <- max(
+  c(
+    x_test_half_2023$Irrigation_volume,
+    x_test_half_2023$pred_observed_rain,
+    x_test_half_2023$pred_no_rain
+  ),
+  na.rm = TRUE
+) / max(x_test_2023$Rain, na.rm = TRUE)
+
+counterfactual_plot_2023 <- ggplot(
+  x_test_half_2023,
+  aes(x = Date)
+) +
+
+  # Rainfall points, read using the right-hand axis
+  geom_point(
+    data = subset(x_test_half_2023, Rain > 0),
+    aes(
+      y = Rain * scale_factor,
+      shape = "Rainfall"
+    ),
+    colour = "grey35",
+    alpha = 0.7,
+    size = 1.4
+  ) +
+
+  # Counterfactual prediction: rainfall set to zero
+  geom_line(
+    aes(
+      y = pred_no_rain,
+      colour = "Prediction with Rain = 0"
+    ),
+    linewidth = 0.6,
+    linetype = "dashed"
+  ) +
+
+  # Prediction using observed rainfall
+  geom_line(
+    aes(
+      y = pred_observed_rain,
+      colour = "Prediction with observed rainfall"
+    ),
+    linewidth = 0.7
+  ) +
+
+  # Observed irrigation
+  geom_point(
+    aes(
+      y = Irrigation_volume,
+      colour = "Observed irrigation"
+    ),
+    size = 1
+  ) +
+
+  facet_wrap(~Site_label, ncol = 5) +
+
+  scale_y_continuous(
+    name = "Irrigation volume (ML/ha)",
+    sec.axis = sec_axis(
+      ~ . / scale_factor,
+      name = "Rainfall (mm)"
+    )
+  ) +
+
+  scale_colour_manual(
+    values = c(
+      "Prediction with observed rainfall" = "blue",
+      "Prediction with Rain = 0" = "black",
+      "Observed irrigation" = "red"
+    )
+  ) +
+
+  scale_shape_manual(
+    values = c("Rainfall" = 17)
+  ) +
+
+  labs(
+    x = "Date",
+    colour = NULL,
+    shape = NULL
+  ) +
+
+  theme_minimal() +
+
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 15),
+    # Axis titles
+    axis.title.x = element_text(size = 13),
+    axis.title.y = element_text(size = 13),
+  
+    # Axis tick labels
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 15)
+  )
+
+counterfactual_plot_2023
+```
+
+# Spatial generalisation in time
+
+## Load data
+
+```{r}
+#2021 data
+irr_dts_cm_data_2021 <- read_csv('path/to/2021/irrigation/data/as/a/csv')
+irr_dts_cm_data_2021 <- irr_dts_cm_data_2021 %>%rename(Date = observation_date)
+
+silo_dts_data_2021 = read_csv('path/to/2021/rainfall/data/as/a/csv')
+silo_dts_data_2021 <- silo_dts_data_2021 %>% rename(Date = observation_date)
+
+s1_dts_data_2021 = read_csv('path/to/2022/s1/data/as/a/csv')
+
+```
+
+### Selection and preparation of all available fields
+
+The `field_select_all()` function prepares Sentinel-1 and irrigation data for all available fields without partitioning the dataset into separate training and testing subsets. It identifies the field columns, assigns zero irrigation volumes to fields without corresponding irrigation records, selects or accepts a non-irrigated control field, and converts the Sentinel-1 and irrigation datasets from wide to long format.
+
+This function is useful when the complete set of available fields is required for model fitting, prediction, or subsequent analysis rather than a random training/test split.
+
+**Inputs**
+
+-   `s1_data`: A wide-format data frame containing Sentinel-1 observations. It must contain a `Date` column and separate columns for each field.
+
+-   `irr_data`: A wide-format data frame containing irrigation observations. It must contain `interval_start`, `interval_end`, and `Date`, together with field-specific irrigation columns corresponding to those in `s1_data`. Fields present in `s1_data` but absent from `irr_data` are assumed to be non-irrigated and are assigned an irrigation volume of zero.
+
+-   `prefix`: Character string used to identify field columns in both datasets. The default is `"TO"`. Any column whose name begins with this prefix is treated as a field.
+
+-   `seed`: Random seed used when selecting a control field if one is not supplied. The default is `123`.
+
+-   `control`: Optional name of the non-irrigated field to use as the Sentinel-1 control field. If `NULL`, one field is randomly selected from those identified as non-irrigated.
+
+**Processing**
+
+All field columns in `s1_data` beginning with the specified `prefix` are identified. Fields that occur in the Sentinel-1 dataset but do not have corresponding columns in `irr_data` are treated as non-irrigated fields, and zero irrigation volumes are added for these fields.
+
+If a control field is not supplied, the function randomly selects one of the identified non-irrigated fields using the specified random seed. If no non-irrigated fields are available for selection, the function stops with an error. A supplied control field is also checked to ensure that it exists in `s1_data`.
+
+The Sentinel-1 dataset is then converted from wide to long format, with:
+
+-   `Treatment`: field identifier.
+
+-   `Value`: Sentinel-1 backscatter observation.
+
+The irrigation dataset is similarly converted to long format, with:
+
+-   `Site`: field identifier.
+
+-   `Irrigation_volume`: irrigation volume associated with the field and observation interval.
+
+The Sentinel-1 time series of the selected control field is extracted, renamed to `S1_control`, and joined to the Sentinel-1 observations for all fields using `Date`.
+
+The selected control-field name is printed during execution.
+
+**Output**
+
+The function returns a list containing:
+
+-   `s1_all`: Long-format Sentinel-1 observations for all identified fields, including the corresponding `S1_control` time series.
+
+-   `irr_all`: Long-format irrigation observations for all identified fields.
+
+-   `selected_fields`: Character vector containing the names of all field columns included in the analysis.
+
+-   `control`: Name of the control field used.
+
+Unlike `field_select()`, this function does not randomly divide fields into training and testing subsets and is inteded for use in the temporal generalisation test. All fields matching the specified prefix are retained in the returned datasets.
+
+```{r}
+field_select_all <- function(
+    s1_data,
+    irr_data,
+    prefix = "TO",
+    seed = 123,
+    control = NULL
+) {
+
+  all_cols <- names(s1_data)
+  all_to_cols <- all_cols[startsWith(all_cols, prefix)]
+
+  all_irr_cols <- names(irr_data)[
+    startsWith(names(irr_data), prefix)
+  ]
+
+  non_irr_cols <- setdiff(all_to_cols, all_irr_cols)
+
+  # Add zero irrigation volumes for fields missing from irrigation data
+  for (col in non_irr_cols) {
+    irr_data[[col]] <- 0
+  }
+
+  # Use the same control field as the trained model if supplied
+  if (is.null(control)) {
+
+    if (length(non_irr_cols) == 0) {
+      stop("No non-irrigated fields are available for control selection.")
+    }
+
+    set.seed(seed)
+    control <- sample(non_irr_cols, 1)
+  }
+
+  # Check that the supplied control exists in the Sentinel-1 data
+  if (!control %in% names(s1_data)) {
+    stop(
+      paste0(
+        "The control field '", control,
+        "' is not present in s1_data."
+      )
+    )
+  }
+
+  message("Control station: ", control)
+
+  s1_all <- s1_data %>%
+    dplyr::select(Date, dplyr::all_of(all_to_cols)) %>%
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(all_to_cols),
+      names_to = "Treatment",
+      values_to = "Value"
+    )
+
+  irr_all <- irr_data %>%
+    dplyr::select(
+      interval_start,
+      interval_end,
+      Date,
+      dplyr::all_of(all_to_cols)
+    ) %>%
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(all_to_cols),
+      names_to = "Site",
+      values_to = "Irrigation_volume"
+    )
+
+  control_data <- s1_data %>%
+    dplyr::select(
+      Date,
+      S1_control = dplyr::all_of(control)
+    )
+
+  s1_all_control <- s1_all %>%
+    dplyr::left_join(
+      control_data,
+      by = "Date"
+    )
+
+  return(
+    list(
+      s1_all = s1_all_control,
+      irr_all = irr_all,
+      selected_fields = all_to_cols,
+      control = control
+    )
+  )
+}
+```
+
+```{r}
+all_data_2021 <- field_select_all(
+  s1_dts_data_2021,
+  irr_dts_cm_data_2021,
+  seed = 311,
+  control = "TO79"
+)
+
+x_all_2021 <- design_mat(
+  all_data_2021$irr_all,
+  all_data_2021$s1_all,
+  silo_dts_data_2021,
+  control = "TO79"
+)
+
+x_all_2021$season_month <- match(x_all_2021$month, c(10, 11, 12, 1, 2, 3, 4))
+```
+
+```{r}
+pred_all_2021 <- predict(
+  gam_dts_vol_2023,
+  newdata = x_all_2021,
+  type = "response",
+  se.fit = TRUE
+)
+```
+
+```{r}
+x_all_2021$predicted_Irrigation_volume <- pred_all_2021$fit
+x_all_2021$predicted_SE <- pred_all_2021$se.fit
+
+x_all_2021$predicted_lower <- x_all_2021$predicted_Irrigation_volume - 1.96 * x_all_2021$predicted_SE
+x_all_2021$predicted_upper <- x_all_2021$predicted_Irrigation_volume + 1.96 * x_all_2021$predicted_SE
+```
+
+```{r}
+set.seed(321)
+
+sites_2021_to_plot <- sample(
+  unique(x_all_2021$Site),
+  size = 15
+)
+
+x_all_2021_plot <- x_all_2021 %>%
+  dplyr::filter(Site %in% sites_2021_to_plot) %>%
+  dplyr::mutate(
+    Field_no = as.integer(
+      gsub("[A-Za-z]+$", "", gsub("^TO", "", Site))
+    ),
+    Site_label = paste0(
+      "Field ",
+      sprintf("%02d", Field_no)
+    )
+  ) %>%
+  dplyr::arrange(Field_no, Date)
+```
+
+```{r}
+test_pred_plot_2021 <- ggplot(
+  x_all_2021_plot,
+  aes(x = Date)
+) +
+  geom_line(
+    aes(
+      y = predicted_Irrigation_volume,
+      color = "Predicted",
+      group = Site
+    ),
+    linewidth = 0.6
+  ) +
+  geom_point(
+    aes(
+      y = predicted_Irrigation_volume,
+      color = "Predicted"
+    ),
+    alpha = 0.3,
+    size = 1.5
+  ) +
+  geom_point(
+    aes(
+      y = Irrigation_volume,
+      color = "Observed"
+    ),
+    size = 1
+  ) +
+  facet_wrap(~ Site_label, ncol = 5) +
+  labs(
+    y = "Irrigation volume (ML/ha)",
+    x = "Date",
+    color = NULL,
+    fill = NULL
+  ) +
+  scale_color_manual(
+    values = c(
+      "Predicted" = "blue",
+      "Observed" = "red"
+    )
+  ) +
+  # scale_fill_manual(
+  #   values = c(
+  #     "70% confidence interval" = "blue"
+  #   )
+  # ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 15),
+    # Axis titles
+    axis.title.x = element_text(size = 13),
+    axis.title.y = element_text(size = 13),
+  
+    # Axis tick labels
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 15)
+  )
+
+test_pred_plot_2021
+```
+
+```{r}
+ggsave(
+  filename = "C:\\Users\\dath3712\\OneDrive - The University of Sydney (Staff)\\Work\\Research_papers\\irrigation_prediction\\figures\\temporal_gen_test_pred_half.png",
+  plot = test_pred_plot_2021,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+```
+
+## Predictions with uncertainties
+
+```{r}
+# Linear predictor matrix for test data
+Xp_test_2021 <- predict(
+  gam_dts_vol_2023,
+  newdata = x_all_2021,
+  type = "lpmatrix"
+)
+
+beta_hat <- coef(gam_dts_vol_2023)
+V_beta   <- vcov(gam_dts_vol_2023)
+
+set.seed(123)
+
+# Coefficient draws
+beta_draws <- MASS::mvrnorm(
+  n = 5000,
+  mu = beta_hat,
+  Sigma = V_beta
+)
+
+# Simulated linear predictors
+eta_draws <- Xp_test_2021 %*% t(beta_draws)
+
+# Check for extreme values before exponentiation
+summary(as.vector(eta_draws))
+max(eta_draws, na.rm = TRUE)
+```
+
+```{r}
+mu_draws <- exp(eta_draws)
+
+x_all_2021$predicted_Irrigation_volume <- predict(
+  gam_dts_vol_2023,
+  newdata = x_all_2021,
+  type = "response"
+)
+
+x_all_2021$predicted_lower <- apply(
+  mu_draws,
+  1,
+  quantile,
+  probs = 0.25,
+  na.rm = TRUE
+)
+
+x_all_2021$predicted_upper <- apply(
+  mu_draws,
+  1,
+  quantile,
+  probs = 0.75,
+  na.rm = TRUE
+)
+```
